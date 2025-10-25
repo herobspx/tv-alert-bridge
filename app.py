@@ -1,144 +1,162 @@
+# app.py
+# -*- coding: utf-8 -*-
+
 import os
 import html
-import json
+import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from dotenv import load_dotenv, find_dotenv
 
-# تحميل المتغيرات
-load_dotenv(find_dotenv())
+# حمّل متغيرات .env
+load_dotenv(dotenv_path=find_dotenv())
 
+# ========= الإعدادات من البيئة =========
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_IDS  = [x.strip() for x in os.getenv("TELEGRAM_CHAT_IDS", "").split(",") if x.strip()]
+CHAT_IDS_RAW = os.getenv("TELEGRAM_CHAT_IDS", "").strip()
 ALERT_SECRET = os.getenv("ALERT_SECRET", "").strip()
-BRIDGE_NAME  = os.getenv("BRIDGE_NAME", "COBOT Bridge").strip()
+BRIDGE_NAME = os.getenv("BRIDGE_NAME", "TV → Telegram Bridge").strip()
 
-if not BOT_TOKEN or not CHAT_IDS or not ALERT_SECRET:
-    raise RuntimeError("❌ تأكد من ضبط TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_IDS و ALERT_SECRET في البيئة.")
+if not BOT_TOKEN or not CHAT_IDS_RAW or not ALERT_SECRET:
+    raise RuntimeError("Missing env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS, ALERT_SECRET")
 
-TG_SEND_MSG   = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-TG_SEND_PHOTO = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+# دعم الفواصل سواء فاصلة أو فاصلة منقوطة أو سطر جديد
+CHAT_IDS = [cid.strip() for sep in [",", ";", "\n"] for cid in CHAT_IDS_RAW.split(sep) if cid.strip()]
+
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
 KSA_TZ = ZoneInfo("Asia/Riyadh")
 
-app = FastAPI(title=f"COBOT Bridge ({BRIDGE_NAME})")
+app = FastAPI(title="TV → Telegram Alert Bridge")
 
-# ======================= دوال المساعدة =======================
-async def send_telegram_message(text: str):
-    async with httpx.AsyncClient(timeout=15) as client:
+
+# ========= Utilities =========
+async def tg_send_text(text: str):
+    """إرسال رسالة HTML لكل معرف قناة/مستخدم في TELEGRAM_CHAT_IDS"""
+    async with httpx.AsyncClient(timeout=10) as client:
+        tasks = []
         for cid in CHAT_IDS:
-            await client.post(TG_SEND_MSG, json={
-                "chat_id": cid,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True
-            })
+            tasks.append(client.post(
+                TG_API,
+                json={
+                    "chat_id": cid,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True
+                }
+            ))
+        if tasks:
+            await asyncio.gather(*tasks)
 
-async def send_telegram_photo(image_path: str = None, image_bytes: bytes = None, caption: str = ""):
-    async with httpx.AsyncClient(timeout=30) as client:
-        for cid in CHAT_IDS:
-            files, data = {}, {"chat_id": cid, "caption": caption, "parse_mode": "HTML"}
-            if image_path:
-                files["photo"] = (os.path.basename(image_path), open(image_path, "rb"), "image/png")
-            elif image_bytes:
-                files["photo"] = ("report.png", image_bytes, "image/png")
-            else:
-                raise ValueError("لم يتم توفير صورة للإرسال.")
-            await client.post(TG_SEND_PHOTO, data=data, files=files)
 
-def map_side(value: str):
-    if not value:
-        return "غير معروف", "⚪️"
-    v = str(value).upper()
-    if v in ("CALL", "BUY", "LONG", "1"): return "CALL", "🟢"
-    if v in ("PUT", "SELL", "SHORT", "-1"): return "PUT", "🔴"
-    return "غير معروف", "⚪️"
+def normalize_side(v: str) -> str:
+    """تحويل نوع الإشارة لقيم CALL/PUT فقط."""
+    if not v:
+        return ""
+    v = v.strip().upper()
+    if v in ("BUY", "CALL", "1", "LONG"):
+        return "CALL"
+    if v in ("SELL", "PUT", "-1", "SHORT"):
+        return "PUT"
+    return ""
 
-def fmt_num(v):
-    try: return f"{float(v):,.6f}".rstrip("0").rstrip(".")
-    except Exception: return str(v)
 
-# ======================= المسارات =======================
+# ========= Endpoints =========
 @app.get("/")
-def home(): return {"ok": True, "bridge": BRIDGE_NAME}
+def root():
+    return {"ok": True, "bridge": BRIDGE_NAME}
+
 
 @app.get("/health")
-def health(): return {"ok": True, "tz": "Asia/Riyadh", "bridge": BRIDGE_NAME}
+def health():
+    return {"ok": True, "bridge": BRIDGE_NAME}
+
 
 @app.post("/tv/{secret}")
-async def tv_alert(secret: str, request: Request):
+async def tv_webhook(secret: str, request: Request):
+    """Webhook من TradingView."""
     if secret != ALERT_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret key")
+        raise HTTPException(status_code=401, detail="invalid secret")
 
+    # حمل البيانات من TradingView بشكل مرن
     try:
         payload = await request.json()
     except Exception:
         raw = (await request.body()).decode("utf-8", "ignore")
-        try: payload = json.loads(raw)
-        except Exception: payload = {"raw": raw}
+        payload = {"raw": raw}
 
-    symbol  = payload.get("ticker") or payload.get("symbol") or "?"
-    side_raw = payload.get("side") or payload.get("order_action") or ""
-    side, emoji = map_side(side_raw)
-    price = payload.get("close") or payload.get("price")
-    timeframe = payload.get("interval") or payload.get("timeframe") or "—"
+    # التقط الحقول باحتمالات مختلفة
+    ticker = (
+        payload.get("ticker")
+        or payload.get("symbol")
+        or payload.get("SYMBOL")
+        or ""
+    )
+
+    side_raw = (
+        payload.get("side")
+        or payload.get("action")
+        or payload.get("order_action")
+        or ""
+    )
+    side = normalize_side(side_raw)
+
+    # السعر/الفريم/ملاحظة (اختياري)
+    price = payload.get("close") or payload.get("price") or payload.get("PRICE")
+    interval = payload.get("interval") or payload.get("tf") or payload.get("INTERVAL")
+    note = payload.get("note") or payload.get("message") or payload.get("text") or ""
+
+    # تجهيز النص (HTML)
+    title = html.escape(ticker.strip() or "—")
+    side_txt = "CALL" if side == "CALL" else ("PUT" if side == "PUT" else "غير معروف")
+    side_emoji = "🟢" if side == "CALL" else ("🔴" if side == "PUT" else "⚪️")
 
     lines = [
-        f"📊 <b>{html.escape(str(symbol))}</b>",
-        f"{emoji} <b>إشارة:</b> {html.escape(side)}",
+        f"<b>📊 {title}</b>",
+        f"إشارة: <b>{side_txt}</b> {side_emoji}",
     ]
-    if price: lines.append(f"💵 <b>السعر:</b> {fmt_num(price)}")
-    if timeframe != "—": lines.append(f"🕓 <b>الإطار الزمني:</b> {html.escape(timeframe)}")
 
-    lines.append("⚠️ جميع مايُطرح يُعتبر اجتهاد فردي ولا يُعتبر توصية شراء أو بيع أو احتفاظ بأي ورقة مالية ⚠️")
-    caption = "\n".join(lines)
+    if price is not None:
+        try:
+            # احرص على عرض السعر كرقم معقول
+            price_f = float(price)
+            lines.append(f"السعر: <b>{price_f:g}</b> 💵")
+        except Exception:
+            lines.append(f"السعر: <b>{html.escape(str(price))}</b> 💵")
 
-    image_url = (payload.get("chart_image_url") or payload.get("screenshot_url") or payload.get("image"))
-    async with httpx.AsyncClient(timeout=15) as client:
-        if image_url:
-            try:
-                r = await client.get(image_url)
-                if r.status_code == 200:
-                    files = {"photo": ("chart.jpg", r.content, "image/jpeg")}
-                    for cid in CHAT_IDS:
-                        data = {"chat_id": cid, "caption": caption, "parse_mode": "HTML"}
-                        await client.post(TG_SEND_PHOTO, data=data, files=files)
-                    return {"ok": True, "photo": True}
-            except Exception:
-                pass
+    if interval:
+        lines.append(f"الإطار الزمني: <b>{html.escape(str(interval))}</b> ⏱")
 
-    await send_telegram_message(caption)
+    # ملاحظة المستخدم (إن وجدت)
+    if note:
+        lines.append(f"📝 {html.escape(str(note))}")
+
+    # تنبيه/إخلاء مسؤولية عربي
+    lines.append("⚠️ <i>جميع مايُطرح يُعَبِّر عن اجتهاد فردي، ولا يُعْتَبَر توصية شراء أو بيع أو احتفاظ بأي ورقة مالية.</i> ⚠️")
+
+    text = "\n".join(lines)
+
+    # أرسل للتليجرام
+    await tg_send_text(text)
     return {"ok": True}
 
-# ======================= مسار إرسال التقرير =======================
+
+# ========= Trigger daily report via HTTP =========
+# يستدعي daily_report.generate_daily_report ويرسل الصورة للتليجرام
 try:
     from daily_report import generate_daily_report
 except Exception:
-    generate_daily_report = None
+    generate_daily_report = None  # لو الملف غير موجود لن يكسر السيرفر
 
-@app.get("/generate-report")
-@app.post("/generate-report")
+@app.get("/generate_report")
 async def generate_report():
-    """إرسال التقرير اليومي كصورة (يستدعي دالة generate_daily_report من daily_report.py)."""
     if generate_daily_report is None:
-        await send_telegram_message("❌ لم يتم العثور على ملف daily_report.py أو الدالة generate_daily_report.")
-        return {"ok": False, "error": "missing daily_report.py"}
-
+        raise HTTPException(status_code=500, detail="daily_report.py غير موجود في المشروع")
     try:
-        result = generate_daily_report(app)
-    except TypeError:
-        result = generate_daily_report()
-
-    caption = result.get("caption", "📈 تقرير COBOT اليومي")
-
-    if isinstance(result, dict):
-        if "image_path" in result and result["image_path"]:
-            await send_telegram_photo(image_path=result["image_path"], caption=caption)
-            return {"ok": True, "mode": "image_path"}
-        elif "image_bytes" in result and result["image_bytes"]:
-            await send_telegram_photo(image_bytes=result["image_bytes"], caption=caption)
-            return {"ok": True, "mode": "image_bytes"}
-
-    await send_telegram_message(str(result))
-    return {"ok": True, "mode": "text"}
+        await generate_daily_report()
+        return {"status": "Report generated and sent"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"report error: {e}")
