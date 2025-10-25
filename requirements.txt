@@ -5,3 +5,5 @@ httpx
 Pillow
 arabic-reshaper
 python-bidi
+arabic-reshaper
+python-bidi
