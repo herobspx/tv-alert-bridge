@@ -1,105 +1,184 @@
-# app.py — TV → Telegram Alert Bridge (Riyadh time, CALL/PUT only)
+# app.py — TV Alert Bridge → Telegram (Arabic, KSA time, image support, CSV logging)
 import os
+import json
 import html
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv, find_dotenv
 import httpx
-from datetime import datetime
-from zoneinfo import ZoneInfo  # Python 3.9+
 
-# ── إعداد البيئة ────────────────────────────────────────────────────────────────
+# ---------- إعداد البيئة ----------
 load_dotenv(find_dotenv())
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_IDS_RAW = os.getenv("TELEGRAM_CHAT_IDS", "").strip()
-ALERT_SECRET = os.getenv("ALERT_SECRET", "").strip()
+CHAT_IDS  = [c.strip() for c in os.getenv("TELEGRAM_CHAT_IDS", "").split(",") if c.strip()]
+ALERT_SECRET = os.getenv("ALERT_SECRET", "").strip() or "spxalert2025"
 
-def _split_ids(raw: str):
-    # نقبل فاصلة أو فاصلة منقوطة أو مسافات
-    seps = [",", ";"]
-    for s in seps:
-        raw = raw.replace(s, " ")
-    return [x for x in (p.strip() for p in raw.split()) if x]
+if not BOT_TOKEN or not CHAT_IDS:
+    raise RuntimeError("يجب ضبط TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_IDS في البيئة.")
 
-CHAT_IDS = _split_ids(CHAT_IDS_RAW)
+TG_SEND_MSG_API   = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+TG_SEND_PHOTO_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+KSA_TZ = ZoneInfo("Asia/Riyadh")
 
-if not BOT_TOKEN or not CHAT_IDS or not ALERT_SECRET:
-    raise RuntimeError("Missing env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS, ALERT_SECRET")
+# ---------- سجل التنبيهات CSV ----------
+import csv
+LOG_DIR  = "logs"
+LOG_FILE = os.path.join(LOG_DIR, "crypto_alerts.csv")
+os.makedirs(LOG_DIR, exist_ok=True)
 
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+def log_alert(symbol: str, side: str, price):
+    ts = datetime.now(KSA_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([ts, str(symbol), str(side), str(price)])
+    except Exception:
+        # لا نكسر الويبهوك لو فشل اللوق
+        pass
 
-# ── تطبيق FastAPI ───────────────────────────────────────────────────────────────
-app = FastAPI(title="TV → Telegram Alert Bridge")
+# ---------- أدوات ----------
+def now_ksa_str(fmt: str = "%Y-%m-%d %H:%M:%S"):
+    return datetime.now(KSA_TZ).strftime(fmt)
+
+def map_side(value: str) -> str:
+    """توحد الإشارة إلى CALL أو PUT فقط."""
+    if not value:
+        return "—"
+    v = str(value).upper()
+    if v in ("CALL", "BUY", "LONG", "1"):
+        return "CALL"
+    if v in ("PUT", "SELL", "SHORT", "-1"):
+        return "PUT"
+    return "—"
+
+def pick_float(*vals):
+    for v in vals:
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except Exception:
+            continue
+    return None
+
+def extract_image_url(payload: dict):
+    # نحاول كل الحقول الشائعة للصور من TradingView
+    return (
+        payload.get("screenshot_url")
+        or payload.get("chart_image_url")
+        or payload.get("chart_image")
+        or payload.get("image")
+        or payload.get("screenshot")
+        or None
+    )
+
+# ---------- تطبيق FastAPI ----------
+app = FastAPI(title="TradingView → Telegram Bridge", version="2.0")
+
+@app.get("/")
+def home():
+    return {
+        "ok": True,
+        "bridge": "TradingView Bridge",
+        "hint": "Use GET /health or POST /tv/{secret}"
+    }
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "bridge": "TradingView Bridge"}
 
-# ── مساعدات ────────────────────────────────────────────────────────────────────
-def norm_side(raw: str):
-    """أعد تصنيف الإشارة بحيث تكون CALL أو PUT فقط."""
-    if not raw:
-        return "PUT"  # افتراضيًا نرمي غير المعروف لـ PUT لتجنّب إشارات شراء خاطئة
-    s = raw.upper().strip()
-    if s in {"CALL", "BUY", "1", "LONG"}:
-        return "CALL"
-    if s in {"PUT", "SELL", "-1", "SHORT"}:
-        return "PUT"
-    return "PUT"
-
-def side_text_and_emoji(side: str):
-    if side == "CALL":
-        return "CALL (شراء)", "🟢"
-    else:
-        return "PUT (بيع)", "🔴"
-
-def riyadh_now():
-    return datetime.now(ZoneInfo("Asia/Riyadh")).strftime("%Y-%m-%d %H:%M:%S KSA")
-
-# ── نقطة استقبال TradingView ───────────────────────────────────────────────────
 @app.post("/tv/{secret}")
-async def tv_alert(secret: str, request: Request):
+async def tv_webhook(secret: str, request: Request):
+    # تحقق السر
     if secret != ALERT_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
+        raise HTTPException(status_code=401, detail="invalid secret")
 
-    # نقبل كلا التنسيقات: symbol/ticker, price/close, interval/tf, side/order_action
+    # محاولة قراءة JSON بأمان
+    raw_body = None
     try:
         payload = await request.json()
     except Exception:
-        payload = {"raw": (await request.body()).decode("utf-8", "ignore")}
+        raw_body = (await request.body()).decode("utf-8", "ignore")
+        try:
+            payload = json.loads(raw_body)
+        except Exception:
+            payload = {"raw": raw_body}
 
-    symbol   = (payload.get("symbol") or payload.get("ticker") or payload.get("SYMBOL") or "").upper() or "UNKNOWN"
-    price    = payload.get("price", payload.get("close", "N/A"))
-    interval = payload.get("interval", payload.get("tf", "1H"))
-    side_in  = payload.get("side", payload.get("order_action", ""))
+    # التقاط الحقول من احتمالات مختلفة
+    symbol   = (payload.get("symbol")
+                or payload.get("ticker")
+                or payload.get("sym")
+                or "UNKNOWN")
 
-    side = norm_side(side_in)
-    side_text, side_emoji = side_text_and_emoji(side)
-    now_str = riyadh_now()
+    side_raw = (payload.get("side")
+                or payload.get("signal")
+                or payload.get("order_action")
+                or payload.get("orderAction")
+                or "")
 
-    # تتبّع في اللوج
-    print(f"ALERT v2 -> symbol={symbol} side={side} price={price} interval={interval}")
+    price    = pick_float(payload.get("price"), payload.get("close"), payload.get("last"))
+    interval = str(payload.get("interval") or payload.get("tf") or "").upper().strip()
+    note     = payload.get("note") or payload.get("message") or payload.get("comment") or ""
 
-    # رسالة تيليجرام (عربية مختصرة ومرتبة)
+    side = map_side(side_raw)
+
+    # نص عربي احترافي (CALL/PUT فقط)
+    # ملاحظة: بناءً على طلبك حذفنا "شراء/بيع"
+    # مثال نهائي:
+    # 📊 BTCUSDT.P
+    # 🟢 إشارة: CALL
+    # 💵 السعر: 68930.12
+    # ⏰ 2025-10-26 01:23:45 KSA
+    icon = "🟢" if side == "CALL" else ("🔴" if side == "PUT" else "⚪")
     lines = [
-        f"📊 <b>{html.escape(symbol)}</b>",
-        f"{side_emoji} إشارة: <b>{side_text}</b>",
-        f"💵 السعر الحالي: <b>{html.escape(str(price))}</b>",
-        f"🕓 الإطار الزمني: <b>{html.escape(str(interval))}</b>",
-        f"⏰ <b>{now_str}</b>",
+        f"📊 <b>{html.escape(str(symbol))}</b>",
+        f"{icon} <b>إشارة:</b> {html.escape(side)}",
     ]
-    text = "\n".join(lines)
+    if price is not None:
+        # تنسيق مبسّط للأرقام العشرية الطويلة
+        ptxt = f"{price:,.6f}".rstrip('0').rstrip('.')
+        lines.append(f"💵 <b>السعر:</b> {ptxt}")
+    # حذفنا الإطار الزمني بناءً على تفضيلك الحالي
+    lines.append(f"⏰ <b>{now_ksa_str()} KSA</b>")
+    if note:
+        lines.append(f"📝 <i>{html.escape(str(note))}</i>")
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    caption = "\n".join(lines)
+
+    # سجّل التنبيه لميزة التقرير اليومي
+    log_alert(symbol, side, price)
+
+    # إرسال تيليجرام (مع صورة الشارت إن وُجدت)
+    image_url = extract_image_url(payload)
+
+    async with httpx.AsyncClient(timeout=15) as client:
         for cid in CHAT_IDS:
-            await client.post(
-                TG_API,
-                json={
-                    "chat_id": cid,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-            )
+            sent_with_photo = False
+            if image_url:
+                try:
+                    r = await client.get(str(image_url))
+                    if r.status_code == 200 and r.content:
+                        files = {"photo": ("chart.jpg", r.content, "image/jpeg")}
+                        data = {
+                            "chat_id": cid,
+                            "caption": caption,
+                            "parse_mode": "HTML",
+                            "disable_notification": False
+                        }
+                        await client.post(TG_SEND_PHOTO_API, data=data, files=files)
+                        sent_with_photo = True
+                except Exception:
+                    sent_with_photo = False
 
-    return {"ok": True}
+            if not sent_with_photo:
+                await client.post(TG_SEND_MSG_API, json={
+                    "chat_id": cid,
+                    "text": caption,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True
+                })
+
+    return JSONResponse({"ok": True})
