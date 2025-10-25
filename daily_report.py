@@ -1,147 +1,261 @@
 # daily_report.py
-import io, os, json, math
+# -*- coding: utf-8 -*-
+
+import os
+import io
+import math
+import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
 import httpx
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
+# ====== دعم العربية (اختياري) ======
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    HAS_AR = True
+except Exception:
+    HAS_AR = False
+
+# ====== إعدادات عامة ======
 KSA_TZ = ZoneInfo("Asia/Riyadh")
-W, H = 1280, 720
-M = 48
-BG_PATH = os.getenv("REPORT_BG", "assets/report_bg.png")
-AR_FONT = os.getenv("AR_FONT_PATH", None)  # اختياري
 
-def _font(size: int) -> ImageFont.FreeTypeFont:
-    if AR_FONT and os.path.exists(AR_FONT):
-        try:
-            return ImageFont.truetype(AR_FONT, size)
-        except Exception:
-            pass
-    # fallback
-    return ImageFont.truetype("DejaVuSans.ttf", size)
+# أبعاد الصورة
+CANVAS_W, CANVAS_H = 1280, 720
+MARGIN = 56
 
-def _load_bg() -> Image.Image:
-    if BG_PATH and os.path.exists(BG_PATH):
-        try:
-            bg = Image.open(BG_PATH).convert("RGB")
-            return bg.resize((W, H), Image.LANCZOS)
-        except Exception:
-            pass
-    # خلفية بديلة بسيطة
-    img = Image.new("RGB", (W, H), (12, 16, 22))
-    grad = Image.linear_gradient("L").resize((W, H))
-    img.paste(Image.new("RGB", (W, H), (20, 26, 36)), mask=grad)
-    return img
+# ألوان
+WHITE = (245, 245, 245)
+SOFT_WHITE = (225, 225, 230)
+DIM_WHITE = (200, 200, 205)
+BLACK = (10, 12, 16)
+CARD_BG = (18, 20, 26, 220)
+GREEN = (66, 186, 150)
+RED = (225, 82, 79)
+AMBER = (255, 193, 7)
 
-def _draw_table(canvas: ImageDraw.ImageDraw, title_font, head_font, cell_font, alerts):
-    # إطار شفاف فوق الخلفية
-    x, y = M, M + 90
-    w, h = W - 2*M, H - (y + M)
-    radius = 20
-    rect = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    rdraw = ImageDraw.Draw(rect)
-    rdraw.rounded_rectangle((0, 0, w, h), radius, fill=(0, 0, 0, 160), outline=(255, 255, 255, 25), width=2)
-    canvas.bitmap((x, y), rect)
+# مسارات الخطوط/الخلفية (اختر ما يناسبك أو اتركها افتراضية)
+FONT_BOLD_PATH = os.getenv("AR_FONT_BOLD", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+FONT_REG_PATH  = os.getenv("AR_FONT_REG",  "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+BG_PATH        = os.getenv("REPORT_BG_PATH", "assets/report_bg.png")  # ضع صورتك هنا
 
-    # العناوين
-    cols = ["العملة", "الإشارة", "السعر"]
-    col_w = [int(w*0.45), int(w*0.25), int(w*0.30)]
-    col_x = [x+24, x+24 + col_w[0], x+24 + col_w[0] + col_w[1]]
-    head_y = y + 24
-    for i, c in enumerate(cols):
-        canvas.text((col_x[i], head_y), c, font=head_font, fill=(220, 230, 255))
-    # خط فاصل
-    canvas.line((x+16, head_y+48, x+w-16, head_y+48), fill=(255,255,255,40), width=2)
-
-    row_y = head_y + 58
-    for item in alerts:
-        sym  = item.get("symbol","—")
-        side = item.get("side","—")     # CALL أو PUT
-        price = item.get("price","—")
-
-        # رمز جانبي بسيط أخضر/أحمر
-        badge_r = 10
-        badge_col = (34,197,94) if str(side).upper()=="CALL" else (239, 68, 68)
-        canvas.ellipse((col_x[1]-32, row_y+8-badge_r, col_x[1]-32+2*badge_r, row_y+8+2*badge_r), fill=badge_col)
-
-        canvas.text((col_x[0], row_y), f"{sym}", font=cell_font, fill=(240, 244, 255))
-        canvas.text((col_x[1], row_y), f"{side}", font=cell_font, fill=(240, 244, 255))
-        canvas.text((col_x[2], row_y), f"{price}", font=cell_font, fill=(240, 244, 255))
-
-        row_y += 50
-        if row_y > y + h - 60:
-            break
-
-async def generate_daily_report(TG_API: str, CHAT_IDS: list[str]) -> dict:
-    """
-    TG_API: مثال https://api.telegram.org/bot<token>/sendPhoto
-    CHAT_IDS: قائمة معرفات القنوات/المجموعات كسلاسل (قد تبدأ بـ -100)
-    """
-    # 1) جهّز اللوحة
-    bg = _load_bg()
-    draw = ImageDraw.Draw(bg)
-    title_font = _font(44)
-    head_font  = _font(28)
-    cell_font  = _font(26)
-    sub_font   = _font(22)
-
-    now = datetime.now(tz=KSA_TZ)
-    title = "📊 تقرير COBOT اليومي"
-    sub   = f"KSA {now:%H:%M}  {now:%d-%m-%Y}"
-
-    draw.text((M, M), title, font=title_font, fill=(255,255,255))
-    draw.text((M, M+54), sub,   font=sub_font,   fill=(185,195,210))
-
-    # 2) اقرأ آخر الإشعارات المخزّنة من الذاكرة المؤقتة (ملف JSON) لو عندك
-    #   هنا مثال مبسّط: لو ما عندنا ملف نقرأ من fallback “تنبيهات اليوم”
-    alerts_path = os.getenv("ALERTS_CACHE_PATH", "/tmp/alerts.json")
-    alerts = []
+def _load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
     try:
-        if os.path.exists(alerts_path):
-            with open(alerts_path, "r", encoding="utf-8") as f:
-                alerts = json.load(f)
+        return ImageFont.truetype(path, size)
     except Exception:
-        alerts = []
-    # لو فاضي، اعرض رسالة لطيفة بس
-    if not alerts:
-        alerts = [
-            {"symbol":"BTCUSDT.P","side":"CALL","price":"—"},
-            {"symbol":"ETHUSDT.P","side":"PUT","price":"—"},
-        ]
+        # fallback عام
+        return ImageFont.load_default()
 
-    _draw_table(draw, title_font, head_font, cell_font, alerts)
+def _ar(text: str) -> str:
+    """تهيئة نص عربي (اختياري)"""
+    if not text:
+        return text
+    if not HAS_AR:
+        return text
+    try:
+        reshaped = arabic_reshaper.reshape(text)
+        bidi_txt = get_display(reshaped)
+        return bidi_txt
+    except Exception:
+        return text
 
-    # عبارة إخلاء المسؤولية
-    disclaimer = "⚠️ جميع ما يُطرح يُعد اجتهادًا فرديًا ولا يُعتبر توصية شراء أو بيع أو احتفاظ بأي ورقة مالية."
-    draw.text((M, H- M - 10), disclaimer, font=sub_font, fill=(200,210,220))
+def _load_background(canvas_w: int, canvas_h: int) -> Image.Image:
+    if os.path.exists(BG_PATH):
+        try:
+            bg = Image.open(BG_PATH).convert("RGB").resize((canvas_w, canvas_h), Image.LANCZOS)
+            # إضافة تمويه خفيف + طبقة غامقة لتعزيز الوضوح
+            bg_blur = bg.filter(ImageFilter.GaussianBlur(2))
+            dark = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 90))
+            bg_blur.paste(dark, (0, 0), dark)
+            return bg_blur.convert("RGB")
+        except Exception:
+            pass
+    # خلفية تدرّجية بسيطة في حال عدم توفر الصورة
+    base = Image.new("RGB", (canvas_w, canvas_h), BLACK)
+    return base
 
-    # 3) احفظ إلى بايتس
+def _draw_header(draw: ImageDraw.ImageDraw, title_f: ImageFont.FreeTypeFont, sub_f: ImageFont.FreeTypeFont):
+    now = datetime.now(KSA_TZ)
+    title  = _ar("📈 تقرير COBOT اليومي")
+    sub    = _ar(f"KSA {now:%H:%M  %Y-%m-%d}")
+
+    # عنوان
+    draw.text((MARGIN, MARGIN), title, font=title_f, fill=WHITE)
+
+    # سطر التاريخ في أقصى اليمين
+    sub_w, _ = draw.textsize(sub, font=sub_f)
+    draw.text((CANVAS_W - MARGIN - sub_w, MARGIN + 6), sub, font=sub_f, fill=SOFT_WHITE)
+
+def _draw_card(draw: ImageDraw.ImageDraw, x1, y1, x2, y2, radius=20):
+    """بطاقة نصف شفافة لطيفة للخلفية وراء الجدول."""
+    card = Image.new("RGBA", (x2 - x1, y2 - y1), CARD_BG)
+    # حواف ناعمة
+    mask = Image.new("L", (x2 - x1, y2 - y1), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.rounded_rectangle((0, 0, x2 - x1, y2 - y1), radius=radius, fill=255)
+    return card, mask
+
+def _format_number(v):
+    try:
+        if v is None:
+            return "-"
+        if isinstance(v, str):
+            return v
+        if abs(v) >= 1000:
+            return f"{v:,.2f}"
+        # أسعار الكريبتو قد تحتاج 4 منازل
+        return f"{v:.4f}" if v < 10 else f"{v:.2f}"
+    except Exception:
+        return str(v)
+
+def _signal_label(side_raw: str) -> tuple[str, tuple[int,int,int]]:
+    s = (side_raw or "").upper().strip()
+    if s in ("BUY", "CALL", "1", "LONG"):
+        return _ar("CALL"), GREEN
+    if s in ("SELL", "PUT", "-1", "SHORT"):
+        return _ar("PUT"), RED
+    return _ar("—"), AMBER
+
+async def _fetch_alerts(source_url: str | None) -> list[dict]:
+    """
+    يجلب تنبيهات اليوم من API. شكل متوقع لكل عنصر:
+    { "symbol": "BTCUSDT.P", "price": 67890.12, "side": "CALL" }
+    """
+    url = source_url or os.getenv("REPORT_SOURCE_URL") or "http://localhost:8000/alerts/today"
+    try:
+        timeout = httpx.Timeout(10.0, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict) and "items" in data:
+                return data["items"]
+            if isinstance(data, list):
+                return data
+            return []
+    except Exception:
+        return []
+
+def _draw_table(img: Image.Image, draw: ImageDraw.ImageDraw, rows: list[dict], fonts: dict):
+    """
+    يرسم جدولاً بسيطاً: [الرمز | السعر | الإشارة]
+    """
+    title_f = fonts["title"]
+    head_f  = fonts["head"]
+    cell_f  = fonts["cell"]
+
+    # بطاقة خلفية للجدول
+    top = MARGIN + 80
+    left = MARGIN
+    right = CANVAS_W - MARGIN
+    bottom = CANVAS_H - MARGIN
+
+    card, mask = _draw_card(draw, left, top, right, bottom, radius=24)
+    img.paste(card, (left, top), mask)
+
+    # رؤوس الأعمدة
+    headers = [_ar("الرمز"), _ar("السعر"), _ar("الإشارة")]
+    # نسّب الأعمدة: رمز 45% | سعر 30% | إشارة 25%
+    col_w = [0.45, 0.30, 0.25]
+    x_positions = [left + 32]
+    x_positions.append(x_positions[0] + int((right - left - 64) * col_w[0]))
+    x_positions.append(x_positions[1] + int((right - left - 64) * col_w[1]))
+
+    y = top + 24
+
+    # خط فاصل خفيف تحت الرأس
+    draw.text((x_positions[0], y), headers[0], font=head_f, fill=SOFT_WHITE)
+    draw.text((x_positions[1], y), headers[1], font=head_f, fill=SOFT_WHITE)
+    draw.text((x_positions[2], y), headers[2], font=head_f, fill=SOFT_WHITE)
+    y += 40
+    draw.line((left + 24, y, right - 24, y), fill=(255,255,255,50), width=1)
+    y += 12
+
+    row_h = 44
+    max_rows = max(1, (bottom - y - 24) // row_h)
+
+    if not rows:
+        # لا توجد بيانات
+        msg = _ar("لا توجد تنبيهات اليوم")
+        draw.text((left + 32, y + 8), msg, font=cell_f, fill=DIM_WHITE)
+        return
+
+    # قص على الأكثر ليستوعب البطاقة
+    rows = rows[:max_rows]
+
+    for r in rows:
+        sym = str(r.get("symbol") or r.get("ticker") or "-")
+        price = r.get("price") or r.get("close") or r.get("last") or None
+        side_raw = r.get("side") or r.get("action")
+
+        sig_txt, sig_color = _signal_label(str(side_raw or ""))
+
+        draw.text((x_positions[0], y), _ar(sym), font=cell_f, fill=WHITE)
+        draw.text((x_positions[1], y), _ar(_format_number(price)), font=cell_f, fill=SOFT_WHITE)
+        draw.text((x_positions[2], y), sig_txt, font=cell_f, fill=sig_color)
+
+        y += row_h
+
+async def generate_daily_report(TG_API: str, CHAT_IDS: list[str | int], source_url: str | None = None) -> dict:
+    """
+    الدالة الأساسية:
+    - تجلب بيانات التنبيهات من API (إن توفّر).
+    - تنشئ صورة تقرير بخلفية.
+    - ترسلها للقنوات/المجموعات المحددة.
+    """
+    # 1) جلب التنبيهات
+    alerts = await _fetch_alerts(source_url)
+
+    # 2) إنشاء الصورة
+    img = _load_background(CANVAS_W, CANVAS_H)
+    draw = ImageDraw.Draw(img)
+
+    # خطوط
+    title_f = _load_font(FONT_BOLD_PATH, 44)
+    head_f  = _load_font(FONT_BOLD_PATH, 28)
+    cell_f  = _load_font(FONT_REG_PATH, 26)
+
+    fonts = {"title": title_f, "head": head_f, "cell": cell_f}
+
+    # هيدر
+    _draw_header(draw, title_f, _load_font(FONT_REG_PATH, 22))
+
+    # جدول
+    _draw_table(img, draw, alerts, fonts)
+
+    # 3) إخراج إلى بافر PNG
     buf = io.BytesIO()
-    bg.save(buf, format="PNG", optimize=True)
+    img.save(buf, format="PNG", optimize=True)
     buf.seek(0)
 
-    # 4) أرسل كتلقرام sendPhoto (multipart)
-    errors = []
-    async with httpx.AsyncClient(timeout=20) as client:
-        for cid in CHAT_IDS:
-            cid = cid.strip()
-            if not cid: 
-                continue
-            try:
-                files = {"photo": ("report.png", buf.getvalue(), "image/png")}
-                data  = {
-                    "chat_id": cid,
-                    "caption": "📈 تقرير COBOT اليومي",
-                    "parse_mode": "HTML",
-                    "disable_notification": True,
-                }
-                resp = await client.post(TG_API, data=data, files=files)
-                print(f"[REPORT] chat={cid} -> {resp.status_code} {resp.text[:200]}")
-                if resp.status_code != 200:
-                    errors.append((cid, resp.text))
-            except Exception as e:
-                errors.append((cid, str(e)))
+    # 4) إرسال الصورة إلى كل قناة
+    results = []
+    caption_text = (
+        "📈 تقرير COBOT اليومي\n"
+        "⚠️ جميع ما يُطرح يُعد اجتهادًا فرديًا ولا يُعتبر توصية شراء أو بيع أو احتفاظ بأي ورقة مالية."
+    )
 
-    if errors:
-        return {"ok": False, "errors": errors}
-    return {"ok": True}
+    timeout = httpx.Timeout(20.0, connect=20.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for cid in CHAT_IDS:
+            files = {"photo": ("report.png", buf.getvalue(), "image/png")}
+            data = {
+                "chat_id": str(cid),
+                "caption": caption_text.strip() or "تقرير COBOT اليومي",
+                "parse_mode": "HTML",
+                "disable_notification": True,
+            }
+            try:
+                resp = await client.post(TG_API, data=data, files=files)
+                ok = bool(resp.status_code == 200 and resp.json().get("ok", True))
+                results.append({"chat_id": str(cid), "ok": ok, "status": resp.status_code, "resp": resp.text[:200]})
+            except Exception as e:
+                results.append({"chat_id": str(cid), "ok": False, "error": str(e)})
+
+    return {
+        "status": "sent",
+        "count": len(results),
+        "results": results,
+    }
