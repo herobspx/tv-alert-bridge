@@ -1,4 +1,11 @@
-# app.py — TV Alert Bridge → Telegram (Arabic, image support, CSV logging, /logs/today API)
+# app.py — TradingView → Telegram Bridge (Arabic, with risk disclaimer)
+# - استقبال تنبيهات من TradingView
+# - إرسالها إلى تيليجرام بتنسيق عربي احترافي
+# - بدون وقت أو فريم
+# - دعم الصور (لقطات الشارت)
+# - تسجيل التنبيهات في CSV
+# - API: /logs/today لعامل التقرير اليومي
+
 import os
 import json
 import html
@@ -37,7 +44,6 @@ def log_alert(symbol: str, side: str, price):
         with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([ts, str(symbol), str(side), str(price)])
     except Exception:
-        # لا نوقف الويبهوك لو فشل اللوق
         pass
 
 # =========================[ أدوات ]=========================
@@ -63,7 +69,7 @@ def pick_float(*vals):
     return None
 
 def extract_image_url(payload: dict):
-    """التقاط رابط لقطة الشارت من أشهر المفاتيح الممكنة من TradingView."""
+    """التقاط رابط لقطة الشارت من مفاتيح مختلفة من TradingView."""
     return (
         payload.get("screenshot_url")
         or payload.get("chart_image_url")
@@ -74,7 +80,7 @@ def extract_image_url(payload: dict):
     )
 
 # =====================[ تطبيق FastAPI ]=====================
-app = FastAPI(title="TradingView → Telegram Bridge", version="2.1")
+app = FastAPI(title="TradingView → Telegram Bridge", version="2.2")
 
 @app.get("/")
 def home():
@@ -122,11 +128,10 @@ def logs_today():
 # ------------------- ويبهوك TradingView -------------------
 @app.post("/tv/{secret}")
 async def tv_webhook(secret: str, request: Request):
-    # تحقق السر
     if secret != ALERT_SECRET:
         raise HTTPException(status_code=401, detail="invalid secret")
 
-    # قراءة JSON بأمان
+    # قراءة JSON
     raw_body = None
     try:
         payload = await request.json()
@@ -137,7 +142,7 @@ async def tv_webhook(secret: str, request: Request):
         except Exception:
             payload = {"raw": raw_body}
 
-    # التقاط الحقول
+    # استخراج الحقول
     symbol   = (payload.get("symbol")
                 or payload.get("ticker")
                 or payload.get("sym")
@@ -149,31 +154,32 @@ async def tv_webhook(secret: str, request: Request):
                 or payload.get("orderAction")
                 or "")
 
-    # السعر فقط (لا نعرض وقت/فريم/دلتا حسب طلبك)
     price    = pick_float(payload.get("price"), payload.get("close"), payload.get("last"))
     note     = payload.get("note") or payload.get("message") or payload.get("comment") or ""
 
     side = map_side(side_raw)
 
-    # -------- نص عربي مبسّط (بدون الوقت/الفريم/الدلتا) --------
+    # -------- نص عربي مبسّط (بدون وقت/فريم/دلتا) --------
     icon = "🟢" if side == "CALL" else ("🔴" if side == "PUT" else "⚪")
     lines = [
         f"📊 <b>{html.escape(str(symbol))}</b>",
         f"{icon} <b>إشارة:</b> {html.escape(side)}",
     ]
     if price is not None:
-        # تنسيق مبسّط للأرقام العشرية الطويلة
         ptxt = f"{price:,.6f}".rstrip('0').rstrip('.')
         lines.append(f"💵 <b>السعر:</b> {ptxt}")
     if note:
         lines.append(f"📝 <i>{html.escape(str(note))}</i>")
 
+    # ⚠️ سطر التحذير الجديد
+    lines.append("⚠️ لاتعتبر توصية مالية، فقط تنويه بحركة السعر ⚠️")
+
     caption = "\n".join(lines)
 
-    # سجل التنبيه للتقرير اليومي
+    # حفظ التنبيه في CSV
     log_alert(symbol, side, price)
 
-    # إرسال تيليجرام (مع صورة الشارت إن وُجدت)
+    # إرسال تيليجرام
     image_url = extract_image_url(payload)
 
     async with httpx.AsyncClient(timeout=15) as client:
