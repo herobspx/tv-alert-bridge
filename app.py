@@ -1,144 +1,210 @@
 # app.py
-# -*- coding: utf-8 -*-
-
 import os
 import html
-import asyncio
+import json
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from typing import Any, Dict, List, Optional
 
-import httpx
 from fastapi import FastAPI, Request, HTTPException
-from dotenv import load_dotenv, find_dotenv
+from fastapi.responses import JSONResponse
 
-# تحميل متغيرات البيئة
-load_dotenv(dotenv_path=find_dotenv())
+import asyncio
+import httpx
 
-# ========= الإعدادات =========
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_IDS_RAW = os.getenv("TELEGRAM_CHAT_IDS", "").strip()
-ALERT_SECRET = os.getenv("ALERT_SECRET", "").strip()
-BRIDGE_NAME = os.getenv("BRIDGE_NAME", "TV → Telegram Bridge").strip()
+# ---- تحميل المتغيرات ----
+try:
+    from dotenv import load_dotenv, find_dotenv
+    load_dotenv(find_dotenv())
+except Exception:
+    pass
+
+BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_IDS_RAW = os.getenv("TELEGRAM_CHAT_IDS", "")
+ALERT_SECRET = os.getenv("ALERT_SECRET", "")
+BRIDGE_NAME  = os.getenv("BRIDGE_NAME", "TV→Telegram Bridge")
 
 if not BOT_TOKEN or not CHAT_IDS_RAW or not ALERT_SECRET:
-    raise RuntimeError("❌ Missing env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS, ALERT_SECRET")
+    raise RuntimeError("Missing env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS, ALERT_SECRET")
 
-# معالجة معرفات التليجرام المتعددة
-CHAT_IDS = [cid.strip() for sep in [",", ";", "\n"] for cid in CHAT_IDS_RAW.split(sep) if cid.strip()]
+# تهيئة تليجرام
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+CHAT_IDS: List[str] = [c.strip() for c in CHAT_IDS_RAW.split(";") if c.strip()]
 
-KSA_TZ = ZoneInfo("Asia/Riyadh")
+# FastAPI
+app = FastAPI(title="TV–Telegram Alert Bridge")
 
-app = FastAPI(title="TV → Telegram Alert Bridge")
+# تخزين بسيط للرسائل (آخر 1000) كي يستخدمها التقرير
+ALERT_BUFFER: List[Dict[str, Any]] = []
+MAX_BUFFER = 1000
+KSA_TZ = "Asia/Riyadh"
 
+# ---- دوال مساعدة ----
+def now_ksa_iso() -> str:
+    # طابع زمني لوجي فقط
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-# ========= أدوات مساعدة =========
-async def tg_send_text(text: str):
-    """إرسال الرسالة إلى كل قناة في TELEGRAM_CHAT_IDS"""
+def normalize_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    نوحّد الحقول الواردة من TradingView قدر الإمكان.
+    """
+    def g(*keys, default=""):
+        for k in keys:
+            if k in data and data[k] not in (None, ""):
+                return data[k]
+        return default
+
+    symbol   = g("ticker", "symbol", "SYMBOL", default=g("TICKER", default="?"))
+    exchange = g("exchange", "EXCHANGE", "market")
+    interval = g("interval", "INTERVAL")
+    price    = g("close", "price", "PRICE")
+    side_raw = (g("side", "action", "order_action", default="").strip().upper())
+
+    if side_raw in ("BUY", "CALL", "1", "LONG"):
+        side = "CALL"
+        side_emoji = "🟢"
+        side_ar = "إشارة"
+    elif side_raw in ("SELL", "PUT", "-1", "SHORT"):
+        side = "PUT"
+        side_emoji = "🔴"
+        side_ar = "إشارة"
+    else:
+        side = "غير معروف"
+        side_emoji = "⚪️"
+        side_ar = "إشارة"
+
+    note = g("note", "message", "text")
+
+    return {
+        "symbol": str(symbol),
+        "exchange": str(exchange) if exchange else "",
+        "interval": str(interval) if interval else "",
+        "price": float(price) if f"{price}".replace(".","",1).isdigit() else price,
+        "side": side,
+        "side_emoji": side_emoji,
+        "side_ar": side_ar,
+        "note": str(note) if note else "",
+    }
+
+def format_telegram_message(p: Dict[str, Any]) -> str:
+    """
+    تنسيق الرسالة بالعربية (HTML) + إخلاء مسؤولية.
+    """
+    symbol = html.escape(p["symbol"])
+    price  = p["price"]
+    interval = html.escape(p["interval"]) if p["interval"] else ""
+    side   = p["side"]
+    side_emoji = p["side_emoji"]
+
+    lines = []
+    lines.append(f"<b>📊 {symbol}</b>")
+    lines.append(f"{p['side_ar']} : <b>{side}</b> {side_emoji}")
+    if isinstance(price, (int, float)):
+        lines.append(f"💵 <b>السعر:</b> {price}")
+    else:
+        lines.append(f"💵 <b>السعر:</b> {html.escape(str(price))}")
+    if interval:
+        lines.append(f"🕒 <b>الإطار الزمني:</b> {interval}")
+
+    # إخلاء مسؤولية حديث
+    lines.append("⚠️ <i>جميع ما يُطرح يُعتبر اجتهادًا فرديًا ولا يُعدّ توصية شراء أو بيع أو احتفاظ بأي ورقة مالية.</i>")
+
+    return "\n".join(lines)
+
+async def send_to_telegram(text: str) -> None:
     async with httpx.AsyncClient(timeout=10) as client:
         tasks = []
         for cid in CHAT_IDS:
-            tasks.append(client.post(
-                TG_API,
-                json={
-                    "chat_id": cid,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True
-                }
-            ))
-        if tasks:
-            await asyncio.gather(*tasks)
+            payload = {
+                "chat_id": cid,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            tasks.append(client.post(TG_API, json=payload))
+        await asyncio.gather(*tasks, return_exceptions=True)
 
+def push_to_buffer(entry: Dict[str, Any]) -> None:
+    ALERT_BUFFER.append(entry)
+    if len(ALERT_BUFFER) > MAX_BUFFER:
+        del ALERT_BUFFER[: len(ALERT_BUFFER) - MAX_BUFFER]
 
-def normalize_side(v: str) -> str:
-    """توحيد نوع الإشارة"""
-    if not v:
-        return ""
-    v = v.strip().upper()
-    if v in ("BUY", "CALL", "1", "LONG"):
-        return "CALL"
-    if v in ("SELL", "PUT", "-1", "SHORT"):
-        return "PUT"
-    return ""
-
-
-# ========= Endpoints =========
-@app.get("/")
-def root():
-    return {"ok": True, "bridge": BRIDGE_NAME}
-
-
+# ---- نقاط الخدمة ----
 @app.get("/health")
 def health():
-    return {"ok": True, "bridge": BRIDGE_NAME}
-
+    return {"ok": True, "bridge": BRIDGE_NAME, "time": now_ksa_iso()}
 
 @app.post("/tv/{secret}")
 async def tv_webhook(secret: str, request: Request):
-    """استقبال تنبيهات TradingView"""
     if secret != ALERT_SECRET:
         raise HTTPException(status_code=401, detail="invalid secret")
 
+    # قراءة جسم الطلب
     try:
-        payload = await request.json()
+        data = await request.json()
     except Exception:
-        raw = (await request.body()).decode("utf-8", "ignore")
-        payload = {"raw": raw}
-
-    ticker = payload.get("ticker") or payload.get("symbol") or payload.get("SYMBOL") or ""
-    side_raw = payload.get("side") or payload.get("action") or payload.get("order_action") or ""
-    side = normalize_side(side_raw)
-
-    price = payload.get("close") or payload.get("price") or payload.get("PRICE")
-    interval = payload.get("interval") or payload.get("tf") or payload.get("INTERVAL")
-
-    # تجهيز الرسالة
-    title = html.escape(ticker.strip() or "—")
-    side_txt = "CALL" if side == "CALL" else ("PUT" if side == "PUT" else "غير معروف")
-    side_emoji = "🟢" if side == "CALL" else ("🔴" if side == "PUT" else "⚪️")
-
-    lines = [
-        f"<b>📊 {title}</b>",
-        f"إشارة: <b>{side_txt}</b> {side_emoji}"
-    ]
-
-    if price is not None:
+        body = await request.body()
         try:
-            price_f = float(price)
-            lines.append(f"السعر: <b>{price_f:g}</b> 💵")
+            data = json.loads(body.decode("utf-8", "ignore"))
         except Exception:
-            lines.append(f"السعر: <b>{html.escape(str(price))}</b> 💵")
+            data = {"raw": (await request.body()).decode("utf-8", "ignore")}
 
-    if interval:
-        lines.append(f"الإطار الزمني: <b>{html.escape(str(interval))}</b> ⏱")
+    # توحيد حقول TradingView
+    payload = normalize_payload(data)
 
-    # نص الإخلاء الجديد
-    lines.append("⚠️ <i>جميع مايُطرح يُعَبِّر عن اجتهاد فردي، ولا يُعْتَبَر توصية شراء أو بيع أو احتفاظ بأي ورقة مالية.</i> ⚠️")
+    # تحضير رسالة تليجرام
+    text = format_telegram_message(payload)
 
-    text = "\n".join(lines)
-    await tg_send_text(text)
+    # إرسال
+    await send_to_telegram(text)
 
-    return {"ok": True}
+    # تخزين في الذاكرة ليستخدمه التقرير
+    entry = {
+        "ts": now_ksa_iso(),
+        "symbol": payload["symbol"],
+        "side": payload["side"],
+        "interval": payload["interval"],
+        "price": payload["price"],
+        "note": payload["note"],
+    }
+    push_to_buffer(entry)
 
+    return {"ok": True, "sent": True}
 
-# ========= توليد التقرير اليومي =========
+@app.get("/alerts")
+def list_alerts(limit: int = 100) -> List[Dict[str, Any]]:
+    """
+    ترجع آخر التنبيهات (تُستخدم بواسطة daily_report.py).
+    """
+    if limit <= 0:
+        limit = 100
+    return ALERT_BUFFER[-limit:]
+
+# ---- استيراد مولّد التقرير (اختياري) ----
 try:
-    from daily_report import generate_daily_report
+    from daily_report import generate_daily_report  # يجب أن تكون async وتستقبل (TG_API, CHAT_IDS)
 except Exception:
     generate_daily_report = None
 
-
 @app.get("/generate_report")
 async def generate_report():
-    """نقطة استدعاء التقرير اليومي"""
+    """
+    استدعاء يدوي لإنتاج صورة التقرير وإرسالها للتليجرام.
+    daily_report.generate_daily_report يجب أن تكون:
+        async def generate_daily_report(TG_API: str, chat_ids: List[str]) -> dict:
+            ...
+    """
     if generate_daily_report is None:
         raise HTTPException(status_code=500, detail="daily_report.py غير موجود في المشروع")
+
     try:
-        generate_daily_report()  # ← تم إزالة await ✅
-        return {"status": "Report generated and sent"}
+        # مهم: نمرّر TG_API و CHAT_IDS كما طلبت
+        result = await generate_daily_report(TG_API, CHAT_IDS)
+        return {"status": "Report generated and sent", "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"report error: {e}")
 
 
-# ========= النهاية =========
+# صفحة جذر بسيطة
+@app.get("/")
+def root():
+    return JSONResponse({"service": BRIDGE_NAME, "endpoints": ["/health", "/tv/{secret}", "/alerts", "/generate_report"]})
