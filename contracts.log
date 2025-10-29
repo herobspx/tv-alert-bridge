@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/Users/badr/Documents/tv-alert-bridge/run_autoresponder.py", line 2, in <module>
+    from aiogram import Bot, Dispatcher, F
+ModuleNotFoundError: No module named 'aiogram'
