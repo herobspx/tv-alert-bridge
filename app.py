@@ -85,44 +85,37 @@ def normalize_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         "note": str(note) if note else "",
     }
 
-def format_telegram_message(p: Dict[str, Any]) -> str:
-    """
-    تنسيق الرسالة بالعربية (HTML) + إخلاء مسؤولية.
-    """
-    symbol = html.escape(p["symbol"])
-    price  = p["price"]
-    interval = html.escape(p["interval"]) if p["interval"] else ""
-    side   = p["side"]
-    side_emoji = p["side_emoji"]
+def format_telegram_message(payload: Dict[str, Any]) -> str:
+    import html as _html
+    sym = str(payload.get("symbol", "")).upper()
+    side = str(payload.get("side", "")).upper()
+    price = payload.get("price", "")
+    interval = str(payload.get("interval", "")).upper()
+    note = str(payload.get("msg") or payload.get("note") or payload.get("text") or "")
+    ts = now_ksa_iso()
 
-    lines = []
-    lines.append(f"<b>📊 {symbol}</b>")
-    lines.append(f"{p['side_ar']} : <b>{side}</b> {side_emoji}")
-    if isinstance(price, (int, float)):
-        lines.append(f"💵 <b>السعر:</b> {price}")
+    # تحويل الاتجاه إلى نص مع أيقونة
+    if side in ("CALL","LONG","BUY","BULL","UP","C"):
+        side_emoji = "🟢 CALL"
+    elif side in ("PUT","SHORT","SELL","BEAR","DOWN","P"):
+        side_emoji = "🔴 PUT"
     else:
-        lines.append(f"💵 <b>السعر:</b> {html.escape(str(price))}")
+        side_emoji = side or "—"
+
+    esc = lambda x: _html.escape(str(x))
+
+    parts = [
+        "<b>🔔 إشعار تداول</b>",
+        f"<b>الرمز:</b> {esc(sym)}",
+        f"<b>الاتجاه:</b> {esc(side_emoji)}",
+        f"<b>السعر:</b> {esc(price)}",
+    ]
     if interval:
-        lines.append(f"🕒 <b>الإطار الزمني:</b> {interval}")
-
-    # إخلاء مسؤولية حديث
-    lines.append("⚠️ <i>جميع ما يُطرح يُعتبر اجتهادًا فرديًا ولا يُعدّ توصية شراء أو بيع أو احتفاظ بأي ورقة مالية.</i>")
-
-    return "\n".join(lines)
-
-async def send_to_telegram(text: str) -> None:
-    async with httpx.AsyncClient(timeout=10) as client:
-        tasks = []
-        for cid in CHAT_IDS:
-            payload = {
-                "chat_id": cid,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            }
-            tasks.append(client.post(TG_API, json=payload))
-        await asyncio.gather(*tasks, return_exceptions=True)
-
+        parts.append(f"<b>الإطار:</b> {esc(interval)}")
+    if note:
+        parts.append(f"<b>ملاحظة:</b> {esc(note)}")
+    parts.append(f"<i>الوقت: {esc(ts)} (KSA)</i>")
+    return "\n".join(parts)
 def push_to_buffer(entry: Dict[str, Any]) -> None:
     ALERT_BUFFER.append(entry)
     if len(ALERT_BUFFER) > MAX_BUFFER:
@@ -133,6 +126,73 @@ def push_to_buffer(entry: Dict[str, Any]) -> None:
 def health():
     return {"ok": True, "bridge": BRIDGE_NAME, "time": now_ksa_iso()}
 
+@app.post("/tv/{secret}")
+async def tv_webhook(secret: str, request: Request):
+    # 1) تحقق السر
+    if secret != ALERT_SECRET:
+        # نعيد 200 لكن نوضح أن السر خطأ لتفادي إعادة المحاولة من TradingView
+        return {"ok": False, "sent": False, "error": "invalid secret"}
+
+    # 2) قراءة جسم الطلب بأمان
+    try:
+        try:
+            data = await request.json()
+        except Exception:
+            body = await request.body()
+            data = {}
+            try:
+                import json as _json
+                data = _json.loads(body.decode("utf-8", "ignore"))
+            except Exception:
+                data = {"raw": body.decode("utf-8", "ignore")}
+    except Exception as e:
+        # حتى لو فشلنا بالقراءة، نعطي رد 200
+        return {"ok": False, "sent": False, "error": f"read_body: {type(e).__name__}"}
+
+    # 3) توحيد الحقول
+    try:
+        payload = normalize_payload(data)
+    except Exception as e:
+        payload = data
+
+    # 4) تنسيق الرسالة مع تحصين
+    try:
+        text = format_telegram_message(payload)
+    except Exception as e:
+        # قالب احتياطي
+        sym = payload.get("symbol","")
+        side = payload.get("side","")
+        price = payload.get("price","")
+        note = payload.get("msg") or payload.get("note") or payload.get("text") or ""
+        text = (f"<b>🔔 إشعار تداول</b>\n"
+                f"<b>الرمز:</b> {sym}\n"
+                f"<b>الاتجاه:</b> {side}\n"
+                f"<b>السعر:</b> {price}\n"
+                + (f"<b>ملاحظة:</b> {note}\n" if note else "")
+                + f"<i>تنسيق الرسالة تعذّر: {type(e).__name__}</i>")
+
+    # 5) الإرسال إلى تيليجرام مع تحصين
+    sent = False
+    try:
+        await send_to_telegram(text)
+        sent = True
+    except Exception as e:
+        # لا نرفع استثناء؛ نُبلغ فقط
+        sent = False
+        err = f"telegram_send: {type(e).__name__}"
+
+    # 6) التخزين الداخلي
+    try:
+        push_to_buffer(payload if isinstance(payload, dict) else {"raw": str(payload)})
+    except Exception:
+        pass
+
+    # 7) استجابة موحّدة 200 دائمًا
+    resp = {"ok": True if sent else False, "sent": sent}
+    if not sent:
+        # إن كان فيه خطأ إرسال، نضيفه برد آمن
+        resp["error"] = locals().get("err", "")
+    return resp
 @app.post("/tv/{secret}")
 async def tv_webhook(secret: str, request: Request):
     if secret != ALERT_SECRET:
