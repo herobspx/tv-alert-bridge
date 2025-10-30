@@ -105,16 +105,16 @@ def format_telegram_message(payload: Dict[str, Any]) -> str:
     esc = lambda x: _html.escape(str(x))
 
     parts = [
-        "🔔 إشعار تداول",
-        f"الرمز: {esc(sym)}",
-        f"الاتجاه: {esc(side_emoji)}",
-        f"السعر: {esc(price)}",
+        "<b>🔔 إشعار تداول</b>",
+        f"<b>الرمز:</b> {esc(sym)}",
+        f"<b>الاتجاه:</b> {esc(side_emoji)}",
+        f"<b>السعر:</b> {esc(price)}",
     ]
     if interval:
-        parts.append(f"الإطار: {esc(interval)}")
+        parts.append(f"<b>الإطار:</b> {esc(interval)}")
     if note:
-        parts.append(f"ملاحظة: {esc(note)}")
-    parts.append(f"الوقت: {esc(ts)} (KSA)")
+        parts.append(f"<b>ملاحظة:</b> {esc(note)}")
+    parts.append(f"<i>الوقت: {esc(ts)} (KSA)</i>")
     return "\n".join(parts)
 def push_to_buffer(entry: Dict[str, Any]) -> None:
     ALERT_BUFFER.append(entry)
@@ -159,7 +159,42 @@ def health():
     return {"ok": True, "bridge": BRIDGE_NAME, "time": now_ksa_iso()}
 
 
+@app.post("/tv/{secret}")
+async def tv_webhook(secret: str, request: Request):
+    if secret != ALERT_SECRET:
+        raise HTTPException(status_code=401, detail="invalid secret")
 
+    # قراءة جسم الطلب
+    try:
+        data = await request.json()
+    except Exception:
+        body = await request.body()
+        try:
+            data = json.loads(body.decode("utf-8", "ignore"))
+        except Exception:
+            data = {"raw": (await request.body()).decode("utf-8", "ignore")}
+
+    # توحيد حقول TradingView
+    payload = normalize_payload(data)
+
+    # تحضير رسالة تليجرام
+    text = format_telegram_message(payload)
+
+    # إرسال
+    await send_to_telegram(text)
+
+    # تخزين في الذاكرة ليستخدمه التقرير
+    entry = {
+        "ts": now_ksa_iso(),
+        "symbol": payload["symbol"],
+        "side": payload["side"],
+        "interval": payload["interval"],
+        "price": payload["price"],
+        "note": payload["note"],
+    }
+    push_to_buffer(entry)
+
+    return {"ok": True, "sent": True}
 
 @app.get("/alerts")
 def list_alerts(limit: int = 100) -> List[Dict[str, Any]]:
@@ -214,105 +249,3 @@ def _inline_tg_send(text: str) -> bool:
             return 200 <= resp.getcode() < 300
     except Exception:
         return False
-
-# === override: inline telegram sender (final) ===
-def _inline_tg_send(text: str) -> bool:  # overrides any previous definition
-    import os, re, urllib.request, urllib.parse
-    token = os.environ.get("BOT_TOKEN", "")
-    chat_id = os.environ.get("CHAT_ID", "")
-    if not token or not chat_id:
-        return False
-    # احذف أي وسوم HTML عشان ما تظهر كرموز في تيليجرام
-    clean = re.sub(r'<[^>]+>', '', str(text))
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": chat_id,
-        "text": clean,
-        "disable_web_page_preview": "true"
-    }).encode("utf-8")
-    try:
-        with urllib.request.urlopen(url, data=data, timeout=10) as resp:
-            return 200 <= resp.getcode() < 300
-    except Exception:
-        return False
-
-# ===== FINAL OVERRIDE: unified TV webhook (formats message exactly as approved) =====
-from typing import Any
-from fastapi import Request, HTTPException
-import os, json
-
-def _build_ai_alert(company_name: str, signal_type: str, price: str, timeframe: str) -> str:
-    sig = (signal_type or "").strip().lower()
-    if sig in ("call","long","buy","up","bull","bullish","صاعد","صعود"):
-        direction = "صاعدة 🟢"
-    elif sig in ("put","short","sell","down","bear","bearish","هابط","هبوط"):
-        direction = "هابطة 🔴"
-    else:
-        direction = "غير معروف"
-
-    company_name = (company_name or "غير معروف").strip()
-    price = (price or "غير معروف").strip()
-    timeframe = (timeframe or "غير معروف").strip()
-
-    text = (
-        "🔔 تنبيه شمعة AI\n\n"
-        f"➤ الشركة: {company_name}\n"
-        f"➤ اتجاه الشمعة: {direction}\n"
-        f"➤ السعر الحالي: ${price}\n"
-        f"➤ الإطار الزمني: {timeframe}\n\n"
-        "⚠️ هذه ليست توصية مالية، وإنما تنبيه للمراقبة."
-    )
-    return text
-
-
-# ===== SINGLE /tv/{secret} HANDLER (final) =====
-from typing import Any
-import os, json
-
-def _build_ai_alert(company_name: str, signal_type: str, price: str, timeframe: str) -> str:
-    sig = (signal_type or "").strip().lower()
-    if sig in ("call","long","buy","up","bull","bullish","صاعد","صعود"):
-        direction = "صاعدة 🟢"
-    elif sig in ("put","short","sell","down","bear","bearish","هابط","هبوط"):
-        direction = "هابطة 🔴"
-    else:
-        direction = "غير معروف"
-
-    company_name = (company_name or "غير معروف").strip()
-    price = (price or "غير معروف").strip()
-    timeframe = (timeframe or "غير معروف").strip()
-
-    text = (
-        "🔔 تنبيه شمعة AI\n\n"
-        f"➤ الشركة: {company_name}\n"
-        f"➤ اتجاه الشمعة: {direction}\n"
-        f"➤ السعر الحالي: ${price}\n"
-        f"➤ الإطار الزمني: {timeframe}\n\n"
-        "⚠️ هذه ليست توصية مالية، وإنما تنبيه للمراقبة."
-    )
-    return text
-
-@app.post("/tv/{secret}")
-async def tv_webhook(secret: str, request: Request):
-    if secret != os.environ.get("ALERT_SECRET",""):
-        return {"ok": False, "sent": False, "error": "invalid secret"}
-
-    # حاول JSON أولاً، ثم bytes
-    try:
-        data = await request.json()
-    except Exception:
-        body = await request.body()
-        try:
-            data = json.loads(body.decode("utf-8","ignore"))
-        except Exception:
-            data = {}
-
-    company = str(data.get("company_name") or data.get("ticker") or "غير معروف")
-    price   = str(data.get("price") or data.get("close") or "غير معروف")
-    tf      = str(data.get("timeframe") or data.get("interval") or "غير معروف")
-    sig     = str(data.get("signal_type") or data.get("side") or "")
-
-    text    = _build_ai_alert(company, sig, price, tf)
-    sent    = _inline_tg_send(text)
-    return {"ok": bool(sent), "sent": bool(sent)}
-

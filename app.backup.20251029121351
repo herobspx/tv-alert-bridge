@@ -160,6 +160,9 @@ def health():
 
 
 
+@app.post("/tv/{secret}")
+async def tv_webhook_disabled(secret: str, request):
+    return {"ok": True, "note": "superseded"}
 
 @app.get("/alerts")
 def list_alerts(limit: int = 100) -> List[Dict[str, Any]]:
@@ -264,40 +267,13 @@ def _build_ai_alert(company_name: str, signal_type: str, price: str, timeframe: 
     )
     return text
 
-
-# ===== SINGLE /tv/{secret} HANDLER (final) =====
-from typing import Any
-import os, json
-
-def _build_ai_alert(company_name: str, signal_type: str, price: str, timeframe: str) -> str:
-    sig = (signal_type or "").strip().lower()
-    if sig in ("call","long","buy","up","bull","bullish","صاعد","صعود"):
-        direction = "صاعدة 🟢"
-    elif sig in ("put","short","sell","down","bear","bearish","هابط","هبوط"):
-        direction = "هابطة 🔴"
-    else:
-        direction = "غير معروف"
-
-    company_name = (company_name or "غير معروف").strip()
-    price = (price or "غير معروف").strip()
-    timeframe = (timeframe or "غير معروف").strip()
-
-    text = (
-        "🔔 تنبيه شمعة AI\n\n"
-        f"➤ الشركة: {company_name}\n"
-        f"➤ اتجاه الشمعة: {direction}\n"
-        f"➤ السعر الحالي: ${price}\n"
-        f"➤ الإطار الزمني: {timeframe}\n\n"
-        "⚠️ هذه ليست توصية مالية، وإنما تنبيه للمراقبة."
-    )
-    return text
-
 @app.post("/tv/{secret}")
 async def tv_webhook(secret: str, request: Request):
+    # تحقق السر من متغير البيئة ALERT_SECRET
     if secret != os.environ.get("ALERT_SECRET",""):
         return {"ok": False, "sent": False, "error": "invalid secret"}
 
-    # حاول JSON أولاً، ثم bytes
+    # قراءة البودي (JSON أو نص) بأمان
     try:
         data = await request.json()
     except Exception:
@@ -307,6 +283,7 @@ async def tv_webhook(secret: str, request: Request):
         except Exception:
             data = {}
 
+    # مفاتيح مرنة (لو TradingView يستخدم أسماء مختلفة)
     company = str(data.get("company_name") or data.get("ticker") or "غير معروف")
     price   = str(data.get("price") or data.get("close") or "غير معروف")
     tf      = str(data.get("timeframe") or data.get("interval") or "غير معروف")
@@ -314,5 +291,5 @@ async def tv_webhook(secret: str, request: Request):
 
     text    = _build_ai_alert(company, sig, price, tf)
     sent    = _inline_tg_send(text)
-    return {"ok": bool(sent), "sent": bool(sent)}
 
+    return {"ok": bool(sent), "sent": bool(sent)}
