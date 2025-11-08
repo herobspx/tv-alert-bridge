@@ -3,7 +3,6 @@ services:
     name: tv-alert-bridge
     env: python
     plan: free
-    region: frankfurt
     buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn app:app --host 0.0.0.0 --port $PORT"
     envVars:
